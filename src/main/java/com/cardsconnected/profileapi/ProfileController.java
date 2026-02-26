@@ -101,6 +101,9 @@ public class ProfileController {
   }
 
   private void upsertUser(String uid, String email, ProfilePayload p) throws SQLException {
+    String photoS3Key = isBlank(p.photoS3Key) ? "users/" + uid + "/profile/none" : p.photoS3Key;
+    String photoUrl = isBlank(p.photoUrl) ? "" : p.photoUrl;
+
     String sql = """
       insert into users (
         firebase_uid,email,first_name,last_name,birthday,address_private,
@@ -135,8 +138,8 @@ public class ProfileController {
       ps.setString(9, p.stateRegion);
       ps.setString(10, p.postalCode);
       ps.setString(11, p.countryCode);
-      ps.setString(12, p.photoS3Key);
-      ps.setString(13, p.photoUrl);
+      ps.setString(12, photoS3Key);
+      ps.setString(13, photoUrl);
       ps.executeUpdate();
     }
   }
@@ -168,9 +171,7 @@ public class ProfileController {
       || isBlank(p.city)
       || isBlank(p.stateRegion)
       || isBlank(p.postalCode)
-      || isBlank(p.countryCode)
-      || isBlank(p.photoS3Key)
-      || isBlank(p.photoUrl);
+      || isBlank(p.countryCode);
   }
 
   private static boolean isBlank(String value) {
