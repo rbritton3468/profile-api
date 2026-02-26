@@ -5,6 +5,7 @@ import com.google.firebase.auth.FirebaseToken;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
@@ -15,12 +16,25 @@ import java.sql.Connection;
 import java.sql.Date;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 @RestController
 @RequestMapping("/profile")
 public class ProfileController {
+  private static final List<String> REQUIRED_FIELDS = List.of(
+    "firstName",
+    "lastName",
+    "birthday",
+    "addressLine1",
+    "city",
+    "stateRegion",
+    "postalCode",
+    "countryCode"
+  );
 
   @GetMapping("/health")
   public Map<String, Object> health() {
@@ -32,28 +46,206 @@ public class ProfileController {
     String sql = "select 1 as ok";
     try (Connection conn = db();
          PreparedStatement ps = conn.prepareStatement(sql);
-         var rs = ps.executeQuery()) {
+         ResultSet rs = ps.executeQuery()) {
       if (rs.next()) {
         return ResponseEntity.ok(Map.of("ok", rs.getInt("ok") == 1));
       }
       return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", "No rows returned"));
     } catch (SQLException sqlException) {
-      StringBuilder details = new StringBuilder();
-      SQLException cur = sqlException;
-      while (cur != null) {
-        details.append("[sqlState=").append(cur.getSQLState())
-          .append(", code=").append(cur.getErrorCode())
-          .append(", msg=").append(cur.getMessage()).append("] ");
-        cur = cur.getNextException();
-      }
-      if (sqlException.getCause() != null) {
-        details.append("cause=").append(sqlException.getCause());
-      }
-      return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-        .body(Map.of("error", "Database error: " + details));
+      return databaseError(sqlException);
     } catch (IllegalStateException stateException) {
-      return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-        .body(Map.of("error", "Config error: " + stateException.getMessage()));
+      return configError(stateException);
+    }
+  }
+
+  @GetMapping("/missing-fields")
+  public ResponseEntity<Map<String, Object>> missingFields(
+    @RequestHeader(value = "Authorization", required = false) String authHeader
+  ) {
+    FirebaseToken decoded;
+    try {
+      decoded = verifyBearer(authHeader);
+    } catch (UnauthorizedException unauthorizedException) {
+      return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", unauthorizedException.getMessage()));
+    }
+
+    String sql = """
+      select first_name,last_name,birthday,address_line1,city,state_region,postal_code,country_code,photo_url
+      from users
+      where firebase_uid=?
+      """;
+
+    try (Connection conn = db(); PreparedStatement ps = conn.prepareStatement(sql)) {
+      ps.setString(1, decoded.getUid());
+
+      try (ResultSet rs = ps.executeQuery()) {
+        if (!rs.next()) {
+          return ResponseEntity.ok(Map.of(
+            "ok", true,
+            "exists", false,
+            "profileComplete", false,
+            "missingRequired", REQUIRED_FIELDS,
+            "missingOptional", List.of("photo")
+          ));
+        }
+
+        List<String> missingRequired = new ArrayList<>();
+        List<String> missingOptional = new ArrayList<>();
+
+        if (isBlank(rs.getString("first_name"))) missingRequired.add("firstName");
+        if (isBlank(rs.getString("last_name"))) missingRequired.add("lastName");
+        if (rs.getDate("birthday") == null) missingRequired.add("birthday");
+        if (isBlank(rs.getString("address_line1"))) missingRequired.add("addressLine1");
+        if (isBlank(rs.getString("city"))) missingRequired.add("city");
+        if (isBlank(rs.getString("state_region"))) missingRequired.add("stateRegion");
+        if (isBlank(rs.getString("postal_code"))) missingRequired.add("postalCode");
+        if (isBlank(rs.getString("country_code"))) missingRequired.add("countryCode");
+        if (isBlank(rs.getString("photo_url"))) missingOptional.add("photo");
+
+        return ResponseEntity.ok(Map.of(
+          "ok", true,
+          "exists", true,
+          "profileComplete", missingRequired.isEmpty(),
+          "missingRequired", missingRequired,
+          "missingOptional", missingOptional
+        ));
+      }
+    } catch (SQLException sqlException) {
+      return databaseError(sqlException);
+    } catch (IllegalStateException stateException) {
+      return configError(stateException);
+    }
+  }
+
+  @PatchMapping("/name")
+  public ResponseEntity<Map<String, Object>> updateName(
+    @RequestHeader(value = "Authorization", required = false) String authHeader,
+    @RequestBody NamePayload payload
+  ) {
+    FirebaseToken decoded;
+    try {
+      decoded = verifyBearer(authHeader);
+    } catch (UnauthorizedException unauthorizedException) {
+      return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", unauthorizedException.getMessage()));
+    }
+
+    if (isBlank(payload.firstName) || isBlank(payload.lastName)) {
+      return ResponseEntity.badRequest().body(Map.of("error", "firstName and lastName are required"));
+    }
+
+    String sql = """
+      update users
+      set first_name=?, last_name=?, updated_at=now()
+      where firebase_uid=?
+      """;
+
+    try (Connection conn = db(); PreparedStatement ps = conn.prepareStatement(sql)) {
+      ps.setString(1, payload.firstName.trim());
+      ps.setString(2, payload.lastName.trim());
+      ps.setString(3, decoded.getUid());
+
+      int updated = ps.executeUpdate();
+      if (updated == 0) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+          .body(Map.of("error", "Profile row not found. Create profile first with /profile/upsert."));
+      }
+
+      return ResponseEntity.ok(Map.of("ok", true));
+    } catch (SQLException sqlException) {
+      return databaseError(sqlException);
+    } catch (IllegalStateException stateException) {
+      return configError(stateException);
+    }
+  }
+
+  @PatchMapping("/address")
+  public ResponseEntity<Map<String, Object>> updateAddress(
+    @RequestHeader(value = "Authorization", required = false) String authHeader,
+    @RequestBody AddressPayload payload
+  ) {
+    FirebaseToken decoded;
+    try {
+      decoded = verifyBearer(authHeader);
+    } catch (UnauthorizedException unauthorizedException) {
+      return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", unauthorizedException.getMessage()));
+    }
+
+    if (isBlank(payload.addressLine1)
+      || isBlank(payload.city)
+      || isBlank(payload.stateRegion)
+      || isBlank(payload.postalCode)
+      || isBlank(payload.countryCode)) {
+      return ResponseEntity.badRequest()
+        .body(Map.of("error", "addressLine1, city, stateRegion, postalCode, and countryCode are required"));
+    }
+
+    String sql = """
+      update users
+      set address_line1=?, address_line2=?, city=?, state_region=?, postal_code=?, country_code=?, updated_at=now()
+      where firebase_uid=?
+      """;
+
+    try (Connection conn = db(); PreparedStatement ps = conn.prepareStatement(sql)) {
+      ps.setString(1, payload.addressLine1.trim());
+      ps.setString(2, isBlank(payload.addressLine2) ? null : payload.addressLine2.trim());
+      ps.setString(3, payload.city.trim());
+      ps.setString(4, payload.stateRegion.trim());
+      ps.setString(5, payload.postalCode.trim());
+      ps.setString(6, payload.countryCode.trim().toUpperCase());
+      ps.setString(7, decoded.getUid());
+
+      int updated = ps.executeUpdate();
+      if (updated == 0) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+          .body(Map.of("error", "Profile row not found. Create profile first with /profile/upsert."));
+      }
+
+      return ResponseEntity.ok(Map.of("ok", true));
+    } catch (SQLException sqlException) {
+      return databaseError(sqlException);
+    } catch (IllegalStateException stateException) {
+      return configError(stateException);
+    }
+  }
+
+  @PatchMapping("/photo")
+  public ResponseEntity<Map<String, Object>> updatePhoto(
+    @RequestHeader(value = "Authorization", required = false) String authHeader,
+    @RequestBody PhotoPayload payload
+  ) {
+    FirebaseToken decoded;
+    try {
+      decoded = verifyBearer(authHeader);
+    } catch (UnauthorizedException unauthorizedException) {
+      return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", unauthorizedException.getMessage()));
+    }
+
+    if (isBlank(payload.photoUrl)) {
+      return ResponseEntity.badRequest().body(Map.of("error", "photoUrl is required"));
+    }
+
+    String sql = """
+      update users
+      set photo_s3_key=?, photo_url=?, updated_at=now()
+      where firebase_uid=?
+      """;
+
+    try (Connection conn = db(); PreparedStatement ps = conn.prepareStatement(sql)) {
+      ps.setString(1, isBlank(payload.photoS3Key) ? "users/" + decoded.getUid() + "/profile/unknown" : payload.photoS3Key.trim());
+      ps.setString(2, payload.photoUrl.trim());
+      ps.setString(3, decoded.getUid());
+
+      int updated = ps.executeUpdate();
+      if (updated == 0) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+          .body(Map.of("error", "Profile row not found. Create profile first with /profile/upsert."));
+      }
+
+      return ResponseEntity.ok(Map.of("ok", true));
+    } catch (SQLException sqlException) {
+      return databaseError(sqlException);
+    } catch (IllegalStateException stateException) {
+      return configError(stateException);
     }
   }
 
@@ -62,18 +254,14 @@ public class ProfileController {
     @RequestHeader(value = "Authorization", required = false) String authHeader,
     @RequestBody ProfilePayload payload
   ) {
+    FirebaseToken decoded;
     try {
-      if (authHeader == null || !authHeader.startsWith("Bearer ")) {
-        return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Missing bearer token"));
-      }
+      decoded = verifyBearer(authHeader);
+    } catch (UnauthorizedException unauthorizedException) {
+      return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", unauthorizedException.getMessage()));
+    }
 
-      FirebaseToken decoded;
-      try {
-        decoded = FirebaseAuth.getInstance().verifyIdToken(authHeader.substring(7));
-      } catch (Exception ex) {
-        return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", "Invalid Firebase ID token"));
-      }
-
+    try {
       if (missingRequired(payload)) {
         return ResponseEntity.badRequest().body(Map.of("error", "Missing required profile fields"));
       }
@@ -81,22 +269,21 @@ public class ProfileController {
       upsertUser(decoded.getUid(), decoded.getEmail(), payload);
       return ResponseEntity.ok(Map.of("ok", true));
     } catch (SQLException sqlException) {
-      StringBuilder details = new StringBuilder();
-      SQLException cur = sqlException;
-      while (cur != null) {
-        details.append("[sqlState=").append(cur.getSQLState())
-          .append(", code=").append(cur.getErrorCode())
-          .append(", msg=").append(cur.getMessage()).append("] ");
-        cur = cur.getNextException();
-      }
-      if (sqlException.getCause() != null) {
-        details.append("cause=").append(sqlException.getCause());
-      }
-      return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-        .body(Map.of("error", "Database error: " + details));
+      return databaseError(sqlException);
     } catch (IllegalStateException stateException) {
-      return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-        .body(Map.of("error", "Config error: " + stateException.getMessage()));
+      return configError(stateException);
+    }
+  }
+
+  private FirebaseToken verifyBearer(String authHeader) throws UnauthorizedException {
+    if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+      throw new UnauthorizedException("Missing bearer token");
+    }
+
+    try {
+      return FirebaseAuth.getInstance().verifyIdToken(authHeader.substring(7));
+    } catch (Exception ex) {
+      throw new UnauthorizedException("Invalid Firebase ID token");
     }
   }
 
@@ -129,15 +316,15 @@ public class ProfileController {
     try (Connection conn = db(); PreparedStatement ps = conn.prepareStatement(sql)) {
       ps.setString(1, uid);
       ps.setString(2, email);
-      ps.setString(3, p.firstName);
-      ps.setString(4, p.lastName);
+      ps.setString(3, p.firstName.trim());
+      ps.setString(4, p.lastName.trim());
       ps.setDate(5, Date.valueOf(p.birthday));
-      ps.setString(6, p.addressLine1);
-      ps.setString(7, p.addressLine2);
-      ps.setString(8, p.city);
-      ps.setString(9, p.stateRegion);
-      ps.setString(10, p.postalCode);
-      ps.setString(11, p.countryCode);
+      ps.setString(6, p.addressLine1.trim());
+      ps.setString(7, isBlank(p.addressLine2) ? null : p.addressLine2.trim());
+      ps.setString(8, p.city.trim());
+      ps.setString(9, p.stateRegion.trim());
+      ps.setString(10, p.postalCode.trim());
+      ps.setString(11, p.countryCode.trim().toUpperCase());
       ps.setString(12, photoS3Key);
       ps.setString(13, photoUrl);
       ps.executeUpdate();
@@ -174,6 +361,28 @@ public class ProfileController {
       || isBlank(p.countryCode);
   }
 
+  private ResponseEntity<Map<String, Object>> databaseError(SQLException sqlException) {
+    StringBuilder details = new StringBuilder();
+    SQLException cur = sqlException;
+    while (cur != null) {
+      details.append("[sqlState=").append(cur.getSQLState())
+        .append(", code=").append(cur.getErrorCode())
+        .append(", msg=").append(cur.getMessage()).append("] ");
+      cur = cur.getNextException();
+    }
+    if (sqlException.getCause() != null) {
+      details.append("cause=").append(sqlException.getCause());
+    }
+
+    return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+      .body(Map.of("error", "Database error: " + details));
+  }
+
+  private ResponseEntity<Map<String, Object>> configError(IllegalStateException stateException) {
+    return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+      .body(Map.of("error", "Config error: " + stateException.getMessage()));
+  }
+
   private static boolean isBlank(String value) {
     return value == null || value.trim().isEmpty();
   }
@@ -190,5 +399,30 @@ public class ProfileController {
     public String countryCode;
     public String photoS3Key;
     public String photoUrl;
+  }
+
+  public static class NamePayload {
+    public String firstName;
+    public String lastName;
+  }
+
+  public static class AddressPayload {
+    public String addressLine1;
+    public String addressLine2;
+    public String city;
+    public String stateRegion;
+    public String postalCode;
+    public String countryCode;
+  }
+
+  public static class PhotoPayload {
+    public String photoS3Key;
+    public String photoUrl;
+  }
+
+  private static class UnauthorizedException extends Exception {
+    UnauthorizedException(String message) {
+      super(message);
+    }
   }
 }
