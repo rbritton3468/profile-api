@@ -19,6 +19,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -109,6 +110,54 @@ public class ProfileController {
           "missingRequired", missingRequired,
           "missingOptional", missingOptional
         ));
+      }
+    } catch (SQLException sqlException) {
+      return databaseError(sqlException);
+    } catch (IllegalStateException stateException) {
+      return configError(stateException);
+    }
+  }
+
+  @GetMapping("/me")
+  public ResponseEntity<Map<String, Object>> me(
+    @RequestHeader(value = "Authorization", required = false) String authHeader
+  ) {
+    FirebaseToken decoded;
+    try {
+      decoded = verifyBearer(authHeader);
+    } catch (UnauthorizedException unauthorizedException) {
+      return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body(Map.of("error", unauthorizedException.getMessage()));
+    }
+
+    String sql = """
+      select email,first_name,last_name,birthday,address_line1,address_line2,city,state_region,postal_code,country_code,photo_url
+      from users
+      where firebase_uid=?
+      """;
+
+    try (Connection conn = db(); PreparedStatement ps = conn.prepareStatement(sql)) {
+      ps.setString(1, decoded.getUid());
+
+      try (ResultSet rs = ps.executeQuery()) {
+        if (!rs.next()) {
+          return ResponseEntity.ok(Map.of("ok", true, "exists", false));
+        }
+
+        Map<String, Object> profile = new HashMap<>();
+        Date birthday = rs.getDate("birthday");
+        profile.put("email", rs.getString("email"));
+        profile.put("firstName", rs.getString("first_name"));
+        profile.put("lastName", rs.getString("last_name"));
+        profile.put("birthday", birthday == null ? null : birthday.toString());
+        profile.put("addressLine1", rs.getString("address_line1"));
+        profile.put("addressLine2", rs.getString("address_line2"));
+        profile.put("city", rs.getString("city"));
+        profile.put("stateRegion", rs.getString("state_region"));
+        profile.put("postalCode", rs.getString("postal_code"));
+        profile.put("countryCode", rs.getString("country_code"));
+        profile.put("photoUrl", rs.getString("photo_url"));
+
+        return ResponseEntity.ok(Map.of("ok", true, "exists", true, "profile", profile));
       }
     } catch (SQLException sqlException) {
       return databaseError(sqlException);
